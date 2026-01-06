@@ -1,4 +1,5 @@
-import pandas as pdimport streamlit as st
+import streamlit as st
+import pandas as pd
 import torch
 import torch.nn as nn
 from torchvision import transforms, models
