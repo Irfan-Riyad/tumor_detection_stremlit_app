@@ -1,4 +1,4 @@
-import streamlit as st
+import pandas as pdimport streamlit as st
 import torch
 import torch.nn as nn
 from torchvision import transforms, models
@@ -11,12 +11,13 @@ import numpy as np
 # Page Config
 # ----------------------------
 st.set_page_config(
-    page_title="Brain Tumor Classifier", 
+    page_title="Brain Tumor Classifier - Debug Mode", 
     page_icon="🧠",
     layout="wide"
 )
 
-st.title("🧠 HybridCNN Brain Tumor Classifier")
+st.title("🧠 HybridCNN Brain Tumor Classifier - Debug Mode")
+st.markdown("**Debugging wrong predictions**")
 
 # ----------------------------
 # Session State
@@ -219,10 +220,17 @@ def predict_with_debug(model, image, transform, device, class_names):
     probs_np = probabilities.cpu().numpy()
     top5_indices = np.argsort(probs_np)[-5:][::-1]  # Get top 5 indices in descending order
     
-    for rank, idx in enumerate(top5_indices, 1):
-        cls = display_classes[idx]
-        prob = probs_np[idx]
-        st.write(f"{rank}. {cls}: {prob:.6f} ({prob*100:.2f}%)")
+    # Create data for table
+    import pandas as pd
+    top5_data = {
+        'Rank': list(range(1, 6)),
+        'Class': [display_classes[idx] for idx in top5_indices],
+        'Probability': [f"{probs_np[idx]:.6f}" for idx in top5_indices],
+        'Percentage': [f"{probs_np[idx]*100:.2f}%" for idx in top5_indices]
+    }
+    
+    df = pd.DataFrame(top5_data)
+    st.table(df)
     
     confidence, predicted_idx = torch.max(probabilities, 0)
     
@@ -343,10 +351,6 @@ if uploaded_image:
                     st.code(traceback.format_exc())
         else:
             st.warning("Please load model first")
-
-# ----------------------------
-# Troubleshooting Guide
-# ----------------------------
 
 st.divider()
 st.caption("Debug Mode - Identifies prediction issues")
