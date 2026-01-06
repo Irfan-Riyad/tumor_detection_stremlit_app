@@ -1,4 +1,4 @@
-import streamlit as st
+import pandas as pdimport streamlit as st
 import torch
 import torch.nn as nn
 from torchvision import transforms, models
@@ -212,9 +212,25 @@ def predict_with_debug(model, image, transform, device, class_names):
     # Softmax
     probabilities = torch.softmax(logits, dim=1)[0]
     
-    st.write("**Probabilities:**")
-    for i, (cls, prob) in enumerate(zip(class_names, probabilities.cpu().numpy())):
-        st.write(f"- {cls}: {prob:.6f} ({prob*100:.2f}%)")
+    st.write("**Top 5 Predictions:**")
+    # Use checkpoint classes if available, otherwise use provided class_names
+    display_classes = st.session_state.checkpoint_classes if st.session_state.checkpoint_classes else class_names
+    
+    # Get top 5 predictions sorted by probability (descending)
+    probs_np = probabilities.cpu().numpy()
+    top5_indices = np.argsort(probs_np)[-5:][::-1]  # Get top 5 indices in descending order
+    
+    # Create data for table
+    import pandas as pd
+    top5_data = {
+        'Rank': list(range(1, 6)),
+        'Class': [display_classes[idx] for idx in top5_indices],
+        'Probability': [f"{probs_np[idx]:.6f}" for idx in top5_indices],
+        'Percentage': [f"{probs_np[idx]*100:.2f}%" for idx in top5_indices]
+    }
+    
+    df = pd.DataFrame(top5_data)
+    st.table(df)
     
     confidence, predicted_idx = torch.max(probabilities, 0)
     
@@ -336,5 +352,5 @@ if uploaded_image:
         else:
             st.warning("Please load model first")
 
-
+st.divider()
 st.caption("Debug Mode - Identifies prediction issues")
