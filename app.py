@@ -1,404 +1,344 @@
-
-import io
-import os
-import time
-import json
-import base64
-import numpy as np
-from typing import List, Tuple, Optional
-
 import streamlit as st
-from PIL import Image
-
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torchvision import models, transforms
+from torchvision import transforms, models
+from PIL import Image
+import io
+import time
+import numpy as np
 
-# Optional but recommended
-import matplotlib.pyplot as plt
-import cv2  # for Grad-CAM heatmap overlay
-from lime import lime_image
-from skimage.segmentation import mark_boundaries
-
-
-# ------------------------------
-# App Config
-# ------------------------------
+# ----------------------------
+# Page Config
+# ----------------------------
 st.set_page_config(
-    page_title="Brain Tumor Classifier (44 classes)",
+    page_title="Brain Tumor Classifier - Debug Mode", 
     page_icon="🧠",
     layout="wide"
 )
 
-# Minimal CSS for a cleaner look
-st.markdown(
-    '''
-    <style>
-    .small { font-size: 0.85rem; color: #6b7280; }
-    .prob { font-weight: 600; }
-    .sidebar .sidebar-content { width: 340px; }
-    .st-emotion-cache-1dp5vir { padding-top: 1rem; }
-    </style>
-    ''',
-    unsafe_allow_html=True
-)
+st.title("🧠 HybridCNN Brain Tumor Classifier - Debug Mode")
+st.markdown("**Debugging wrong predictions**")
 
+# ----------------------------
+# Session State
+# ----------------------------
+if 'model' not in st.session_state:
+    st.session_state.model = None
+if 'class_names' not in st.session_state:
+    st.session_state.class_names = None
+if 'device' not in st.session_state:
+    st.session_state.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if 'checkpoint_classes' not in st.session_state:
+    st.session_state.checkpoint_classes = None
 
+# ----------------------------
+# HybridCNN Model (Exact Match)
+# ----------------------------
+class HybridCNN(nn.Module):
+    def __init__(self, num_classes, pretrained=True, freeze_backbones=True, hidden=1024, p=0.5):
+        super().__init__()
+        r_weights = models.ResNet50_Weights.IMAGENET1K_V2 if pretrained else None
+        d_weights = models.DenseNet121_Weights.IMAGENET1K_V1 if pretrained else None
 
-# ------------------------------
-# Utility: Caching
-# ------------------------------
-@st.cache_resource(show_spinner=False)
-def get_device():
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.resnet = models.resnet50(weights=r_weights)
+        self.resnet.fc = nn.Identity()
 
-DEVICE = get_device()
+        self.densenet = models.densenet121(weights=d_weights)
+        self.densenet.classifier = nn.Identity()
 
-@st.cache_resource(show_spinner=False)
-def build_model(arch: str, num_classes: int, pretrained: bool = True) -> nn.Module:
-    # Create a torchvision model and replace the classifier head for num_classes.
-    arch = arch.lower()
-    if arch == "efficientnet_b0":
-        weights = models.EfficientNet_B0_Weights.IMAGENET1K_V1 if pretrained else None
-        model = models.efficientnet_b0(weights=weights)
-        in_features = model.classifier[-1].in_features
-        model.classifier[-1] = nn.Linear(in_features, num_classes)
-    elif arch == "densenet121":
-        weights = models.DenseNet121_Weights.IMAGENET1K_V1 if pretrained else None
-        model = models.densenet121(weights=weights)
-        in_features = model.classifier.in_features
-        model.classifier = nn.Linear(in_features, num_classes)
-    elif arch == "resnet50":
-        weights = models.ResNet50_Weights.IMAGENET1K_V1 if pretrained else None
-        model = models.resnet50(weights=weights)
-        in_features = model.fc.in_features
-        model.fc = nn.Linear(in_features, num_classes)
+        feat_dim = 2048 + 1024
+
+        if freeze_backbones:
+            for m in [self.resnet, self.densenet]:
+                for p_ in m.parameters():
+                    p_.requires_grad = False
+
+        self.head = nn.Sequential(
+            nn.Linear(feat_dim, hidden),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p),
+            nn.Linear(hidden, num_classes)
+        )
+
+    def forward(self, x):
+        f1 = self.resnet(x)
+        f2 = self.densenet(x)
+        fused = torch.cat([f1, f2], dim=1)
+        return self.head(fused)
+
+# ----------------------------
+# Model Loader with Debug Info
+# ----------------------------
+def load_model_debug(model_file, num_classes):
+    """
+    Load model with extensive debugging
+    """
+    device = st.session_state.device
+    
+    st.info("🔍 Loading checkpoint...")
+    checkpoint = torch.load(model_file, map_location=device)
+    
+    # Debug checkpoint structure
+    st.write("**Checkpoint Structure:**")
+    if isinstance(checkpoint, dict):
+        st.write(f"- Type: Dictionary")
+        st.write(f"- Keys: {list(checkpoint.keys())}")
+        
+        # Check for classes in checkpoint
+        if 'classes' in checkpoint:
+            st.session_state.checkpoint_classes = checkpoint['classes']
+            st.success(f"✅ Found classes in checkpoint: {checkpoint['classes']}")
+        else:
+            st.warning("⚠️ No 'classes' key found in checkpoint")
     else:
-        raise ValueError(f"Unknown architecture: {arch}")
-    return model
-
-@st.cache_resource(show_spinner=False)
-def load_model(arch: str, num_classes: int, state_dict_bytes: Optional[bytes]) -> nn.Module:
-    # Build model and load weights if provided. Accepts arbitrary state_dict keys with strict=False.
-    model = build_model(arch, num_classes, pretrained=True)
-    if state_dict_bytes is not None:
-        try:
-            buffer = io.BytesIO(state_dict_bytes)
-            ckpt = torch.load(buffer, map_location="cpu")
-            if isinstance(ckpt, dict) and "state_dict" in ckpt:
-                state = ckpt["state_dict"]
-                # If saved with lightning or ddp, keys may have 'model.' or 'module.' prefix
-                cleaned = {k.replace("model.", "").replace("module.", ""): v for k, v in state.items()}
-                missing, unexpected = model.load_state_dict(cleaned, strict=False)
-            elif isinstance(ckpt, dict):
-                cleaned = {k.replace("model.", "").replace("module.", ""): v for k, v in ckpt.items()}
-                missing, unexpected = model.load_state_dict(cleaned, strict=False)
-            else:
-                # Try raw state_dict
-                missing, unexpected = model.load_state_dict(ckpt, strict=False)
-            st.caption(f"Loaded checkpoint with missing keys: {len(missing)} | unexpected keys: {len(unexpected)}")
-        except Exception as e:
-            st.warning(f"Could not load checkpoint. Using pretrained weights. Error: {e}")
-    model.eval()
-    model.to(DEVICE)
-    return model
-
-@st.cache_data(show_spinner=False)
-def load_class_names_from_txt(txt_bytes: bytes) -> List[str]:
-    text = txt_bytes.decode("utf-8", errors="ignore")
-    names = [line.strip() for line in text.splitlines() if line.strip()]
-    return names
-
-def default_class_names(n=44) -> List[str]:
-    return [f"class_{i}" for i in range(n)]
-
-# ------------------------------
-# Preprocessing & Prediction
-# ------------------------------
-@st.cache_resource(show_spinner=False)
-def get_transform(image_size: int = 224):
-    return transforms.Compose([
-        transforms.Resize((image_size, image_size)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225]),
-    ])
-
-def preprocess_image(pil_img: Image.Image, image_size: int = 224) -> torch.Tensor:
-    tfm = get_transform(image_size)
-    tensor = tfm(pil_img).unsqueeze(0)  # shape (1, 3, H, W)
-    return tensor
-
-@torch.no_grad()
-def predict(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
-    x = x.to(DEVICE)
-    logits = model(x)
-    probs = F.softmax(logits, dim=1)
-    return probs.squeeze(0).detach().cpu()  # shape: (C,)
-
-def topk(probs: torch.Tensor, k: int = 5) -> Tuple[List[int], List[float]]:
-    vals, idxs = torch.topk(probs, k)
-    return idxs.tolist(), vals.tolist()
-
-# ------------------------------
-# Grad-CAM
-# ------------------------------
-class GradCAM:
-    def __init__(self, model: nn.Module, target_layer: Optional[nn.Module] = None):
-        self.model = model
-        self.gradients = None
-        self.activations = None
-
-        # Find the last conv layer if not provided
-        if target_layer is None:
-            target_layer = self._find_last_conv_layer(model)
-        self.target_layer = target_layer
-
-        # Register hooks
-        def forward_hook(module, inp, out):
-            self.activations = out.detach()
-
-        def backward_hook(module, grad_in, grad_out):
-            self.gradients = grad_out[0].detach()
-
-        self.fh = self.target_layer.register_forward_hook(forward_hook)
-        self.bh = self.target_layer.register_backward_hook(backward_hook)
-
-    def _find_last_conv_layer(self, model: nn.Module) -> nn.Module:
-        last_conv = None
-        for m in model.modules():
-            if isinstance(m, nn.Conv2d):
-                last_conv = m
-        if last_conv is None:
-            raise RuntimeError("No Conv2d layer found for Grad-CAM.")
-        return last_conv
-
-    def __call__(self, input_tensor: torch.Tensor, class_idx: Optional[int] = None) -> np.ndarray:
-        self.model.zero_grad()
-        logits = self.model(input_tensor.to(DEVICE))
-        if class_idx is None:
-            class_idx = logits.argmax(dim=1).item()
-        score = logits[:, class_idx]
-        score.backward(retain_graph=True)
-
-        # GAP over gradients
-        gradients = self.gradients  # (N,C,H,W)
-        activations = self.activations  # (N,C,H,W)
-        weights = torch.mean(gradients, dim=(2, 3), keepdim=True)  # (N,C,1,1)
-        cam = F.relu(torch.sum(weights * activations, dim=1))  # (N,H,W)
-        cam = cam[0].detach().cpu().numpy()
-        # Normalize to [0,1]
-        cam = (cam - cam.min()) / (cam.max() + 1e-8)
-        return cam
-
-    def release(self):
-        try:
-            self.fh.remove()
-            self.bh.remove()
-        except Exception:
-            pass
-
-def overlay_cam_on_image(cam: np.ndarray, pil_img: Image.Image, alpha: float = 0.5) -> Image.Image:
-    img = np.array(pil_img.convert("RGB"))
-    H, W = img.shape[:2]
-    cam_resized = cv2.resize(cam, (W, H))
-    heatmap = cv2.applyColorMap(np.uint8(255 * cam_resized), cv2.COLORMAP_JET)
-    heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
-    overlay = np.uint8(alpha * heatmap + (1 - alpha) * img)
-    return Image.fromarray(overlay)
-
-# ------------------------------
-# LIME
-# ------------------------------
-def make_lime_explainer():
-    return lime_image.LimeImageExplainer()
-
-def _lime_predict_proba_fn(model, image_size):
-    # LIME passes a batch of images as float arrays in [0,1] RGB
-    tfm = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Resize((image_size, image_size)),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225])
-    ])
-
-    def _fn(batch: np.ndarray) -> np.ndarray:
-        # batch: (N,H,W,3) in [0,1]
-        with torch.no_grad():
-            tensors = []
-            for arr in batch:
-                img = Image.fromarray((arr * 255).astype(np.uint8))
-                tensors.append(tfm(img))
-            x = torch.stack(tensors, dim=0).to(DEVICE)
-            logits = model(x)
-            probs = F.softmax(logits, dim=1).detach().cpu().numpy()
-            return probs
-    return _fn
-
-# ------------------------------
-# Sidebar: Model & Assets
-# ------------------------------
-st.sidebar.title("👤 *Md Riyad Hossain*")
-st.sidebar.title("⚙️ Settings")
-st.sidebar.write("Choose a model, load weights, and provide class names (44 classes).")
-
-arch = st.sidebar.selectbox(
-    "Architecture",
-    options=["efficientnet_b0", "densenet121", "resnet50"],
-    index=0,
-    help="Pick the backbone to use for inference."
-)
-
-num_classes = st.sidebar.number_input(
-    "Number of classes",
-    min_value=2, max_value=200, value=44, step=1
-)
-
-weights_file = st.sidebar.file_uploader(
-    "Upload model weights (.pth/.pt, optional)",
-    type=["pth", "pt"],
-    accept_multiple_files=False
-)
-
-classes_file = st.sidebar.file_uploader(
-    "Upload classes.txt (one label per line)",
-    type=["txt"],
-    accept_multiple_files=False
-)
-
-image_size = st.sidebar.slider("Image size", 128, 512, 224, step=32)
-show_gradcam = st.sidebar.checkbox("Show Grad-CAM", value=True)
-show_lime = st.sidebar.checkbox("Show LIME", value=False, help="LIME is slower. Turn on when needed.")
-topk_k = st.sidebar.slider("Top-K predictions to show", 1, 10, 5)
-
-# Load class names
-if classes_file is not None:
-    class_names = load_class_names_from_txt(classes_file.getvalue())
-    if len(class_names) != num_classes:
-        st.sidebar.warning(f"classes.txt has {len(class_names)} labels but num_classes is {num_classes}. They should match.")
-else:
-    class_names = default_class_names(num_classes)
-
-# Load model
-state_bytes = weights_file.getvalue() if weights_file is not None else None
-model = load_model(arch, num_classes, state_bytes)
-
-# ------------------------------
-# Main: Upload, Predict, Explain
-# ------------------------------
-st.title("🧠 Brain Tumor Classifier")
-st.caption("Upload a brain MRI image. The app predicts one of the 44 classes, and can explain the decision with Grad-CAM and LIME.")
-
-colA, colB = st.columns([1, 1])
-
-with colA:
-    uploaded = st.file_uploader("Upload image (PNG/JPG)", type=["png", "jpg", "jpeg"], accept_multiple_files=False)
-    if uploaded is not None:
-        pil = Image.open(uploaded).convert("RGB")
-        st.image(pil, caption="Uploaded image", use_column_width=True)
-    else:
-        st.info("Please upload an image to begin.")
-
-with colB:
-    st.markdown("**Model Info**")
-    st.write(f"- Device: `{DEVICE}`")
-    st.write(f"- Architecture: `{arch}`")
-    st.write(f"- Classes: `{num_classes}`")
-    if weights_file is not None:
-        st.write(f"- Weights: `{weights_file.name}`")
-    if classes_file is not None:
-        st.write(f"- Labels: `{classes_file.name}`")
-    st.caption("Tip: For best results, upload your trained checkpoint that matches the 44-class dataset and a matching classes.txt file.")
-
-st.markdown("---")
-
-if uploaded is not None:
-    # Prediction
-    with st.spinner("Running inference..."):
-        x = preprocess_image(pil, image_size=image_size)
-        probs = predict(model, x)
-        idxs, vals = topk(probs, k=topk_k)
-
-    # Display top-k
-    st.subheader("Predictions")
-    rows = []
-    for rank, (i, p) in enumerate(zip(idxs, vals), start=1):
-        rows.append((rank, class_names[i] if i < len(class_names) else f"class_{i}", float(p)))
-    # Show as table
-    st.dataframe(
-        {"Rank": [r[0] for r in rows],
-         "Class": [r[1] for r in rows],
-         "Probability": [f"{r[2]*100:.2f}%" for r in rows]},
-        hide_index=True,
-        use_container_width=True
+        st.write(f"- Type: {type(checkpoint)}")
+    
+    # Create model
+    st.info(f"🏗️ Creating HybridCNN with {num_classes} classes...")
+    model = HybridCNN(
+        num_classes=num_classes,
+        pretrained=False,
+        freeze_backbones=False,
+        hidden=1024,
+        p=0.5
     )
+    
+    # Load state dict
+    try:
+        if isinstance(checkpoint, dict):
+            if 'state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['state_dict'])
+                st.success("✅ Loaded from 'state_dict' key")
+            elif 'model_state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['model_state_dict'])
+                st.success("✅ Loaded from 'model_state_dict' key")
+            else:
+                model.load_state_dict(checkpoint)
+                st.success("✅ Loaded checkpoint directly")
+        else:
+            model = checkpoint
+            st.success("✅ Checkpoint is the model itself")
+    except Exception as e:
+        st.error(f"❌ Error loading state dict: {e}")
+        return None
+    
+    model.to(device)
+    model.eval()
+    
+    # Verify model structure
+    st.write("**Model Structure Verification:**")
+    st.write(f"- Final layer output features: {model.head[-1].out_features}")
+    st.write(f"- Expected classes: {num_classes}")
+    
+    if model.head[-1].out_features != num_classes:
+        st.error(f"❌ MISMATCH! Model has {model.head[-1].out_features} outputs but you provided {num_classes} classes!")
+    
+    return model
 
-    # Bar chart
-    fig, ax = plt.subplots(figsize=(6, 3.5))
-    labels = [r[1] for r in rows]
-    values = [r[2] for r in rows]
-    ax.bar(range(len(values)), values)
-    ax.set_xticks(range(len(values)))
-    ax.set_xticklabels(labels, rotation=20, ha="right")
-    ax.set_ylabel("Probability")
-    ax.set_ylim(0, 1)
-    ax.set_title("Top-K Predicted Probabilities")
-    st.pyplot(fig, clear_figure=True)
+# ----------------------------
+# Load Classes
+# ----------------------------
+def load_classes(classes_file):
+    content = classes_file.read().decode('utf-8')
+    classes = [line.strip() for line in content.split('\n') if line.strip()]
+    return classes
 
-    # Explanations in tabs
-    tabs = []
-    if show_gradcam and show_lime:
-        tabs = st.tabs(["Grad-CAM", "LIME"])
-    elif show_gradcam:
-        tabs = st.tabs(["Grad-CAM"])
-    elif show_lime:
-        tabs = st.tabs(["LIME"])
+# ----------------------------
+# Multiple Transform Options for Testing
+# ----------------------------
+def get_transform_v1(img_size=224):
+    """Original transform - exactly as training"""
+    return transforms.Compose([
+        transforms.Resize((img_size, img_size)),
+        transforms.ToTensor(),
+        transforms.Lambda(lambda t: t.expand(3, -1, -1) if t.shape[0] == 1 else t),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
 
-    if show_gradcam:
-        tab = tabs[0] if tabs else st.container()
-        with tab:
-            st.subheader("Grad-CAM")
-            with st.spinner("Computing Grad-CAM..."):
-                cam_util = GradCAM(model)
-                cam = cam_util(x)
-                cam_img = overlay_cam_on_image(cam, pil, alpha=0.5)
-                cam_util.release()
-            c1, c2 = st.columns(2)
-            with c1:
-                st.image(pil, caption="Original", use_column_width=True)
-            with c2:
-                st.image(cam_img, caption="Grad-CAM Overlay", use_column_width=True)
-            st.caption("Grad-CAM highlights regions that most strongly influenced the predicted class.")
+def get_transform_v2(img_size=224):
+    """Alternative: No lambda expansion"""
+    return transforms.Compose([
+        transforms.Resize((img_size, img_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
 
-    if show_lime:
-        tab = tabs[1] if show_gradcam and show_lime else (tabs[0] if tabs else st.container())
-        with tab:
-            st.subheader("LIME")
-            st.caption("LIME perturbs the image and learns a simple local model to explain the prediction. This can take 10–30 seconds.")
-            with st.spinner("Running LIME..."):
-                explainer = make_lime_explainer()
-                lime_fn = _lime_predict_proba_fn(model, image_size=image_size)
-                np_img = np.array(pil).astype(np.float32) / 255.0
-                # focus on top predicted class
-                pred_idx = int(torch.argmax(probs).item())
-                explanation = explainer.explain_instance(
-                    np_img,
-                    lime_fn,
-                    top_labels=1,
-                    hide_color=0,
-                    num_samples=1000
-                )
-                temp, mask = explanation.get_image_and_mask(
-                    label=pred_idx, positive_only=True, hide_rest=False, num_features=8, min_weight=0.0
-                )
-                lime_vis = mark_boundaries(temp / 255.0, mask)
-                lime_vis = (lime_vis * 255).astype(np.uint8)
-                st.image(lime_vis, caption=f"LIME for '{class_names[pred_idx] if pred_idx < len(class_names) else pred_idx}'", use_column_width=True)
+def get_transform_v3(img_size=224):
+    """Alternative: With center crop"""
+    return transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(img_size),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
 
-# ------------------------------
-# Footer
-# ------------------------------
-st.markdown("---")
-st.caption("Built with Streamlit + PyTorch. Provide your own trained 44-class weights and labels to match the dataset.")
-st.caption("by **Md Riyad Hossain**")
+# ----------------------------
+# Prediction with Debug Info
+# ----------------------------
+@torch.no_grad()
+def predict_with_debug(model, image, transform, device, class_names):
+    """
+    Predict with extensive debugging
+    """
+    model.eval()
+    
+    # Show original image stats
+    img_array = np.array(image)
+    st.write("**Input Image Stats:**")
+    st.write(f"- Shape: {img_array.shape}")
+    st.write(f"- Data type: {img_array.dtype}")
+    st.write(f"- Min value: {img_array.min()}")
+    st.write(f"- Max value: {img_array.max()}")
+    st.write(f"- Mean: {img_array.mean():.2f}")
+    
+    # Apply transform
+    input_tensor = transform(image).unsqueeze(0).to(device)
+    
+    st.write("**After Transform:**")
+    st.write(f"- Tensor shape: {input_tensor.shape}")
+    st.write(f"- Tensor device: {input_tensor.device}")
+    st.write(f"- Tensor min: {input_tensor.min().item():.4f}")
+    st.write(f"- Tensor max: {input_tensor.max().item():.4f}")
+    st.write(f"- Tensor mean: {input_tensor.mean().item():.4f}")
+    st.write(f"- Tensor std: {input_tensor.std().item():.4f}")
+    
+    # Forward pass
+    logits = model(input_tensor)
+    
+    st.write("**Model Output (Logits):**")
+    st.write(f"- Logits shape: {logits.shape}")
+    st.write(f"- Logits: {logits[0].cpu().numpy()}")
+    
+    # Softmax
+    probabilities = torch.softmax(logits, dim=1)[0]
+    
+    st.write("**Probabilities:**")
+    # Use checkpoint classes if available, otherwise use provided class_names
+    display_classes = st.session_state.checkpoint_classes if st.session_state.checkpoint_classes else class_names
+    for i, (cls, prob) in enumerate(zip(display_classes, probabilities.cpu().numpy())):
+        st.write(f"- {cls}: {prob:.6f} ({prob*100:.2f}%)")
+    
+    confidence, predicted_idx = torch.max(probabilities, 0)
+    
+    return predicted_idx.item(), confidence.item(), probabilities.cpu()
+
+# ----------------------------
+# Sidebar
+# ----------------------------
+st.sidebar.header("⚙️ Configuration")
+
+model_file = st.sidebar.file_uploader("📦 Upload Model (.pth)", type=['pth', 'pt'])
+classes_file = st.sidebar.file_uploader("📋 Upload Classes (.txt)", type=['txt'])
+
+img_size = st.sidebar.number_input("🖼️ Image Size", min_value=128, max_value=512, value=224, step=32)
+
+transform_version = st.sidebar.selectbox(
+    "🔄 Transform Version",
+    ["v1 (Original)", "v2 (No Lambda)", "v3 (Center Crop)"],
+    help="Try different transforms to see which matches training"
+)
+
+if st.sidebar.button("🔄 Load Model", type="primary"):
+    if model_file and classes_file:
+        with st.spinner("Loading..."):
+            try:
+                class_names = load_classes(classes_file)
+                st.sidebar.write(f"**Classes from file ({len(class_names)}):**")
+                for i, cls in enumerate(class_names):
+                    st.sidebar.write(f"{i}: {cls}")
+                
+                model_file.seek(0)
+                model = load_model_debug(model_file, len(class_names))
+                
+                if model:
+                    st.session_state.model = model
+                    st.session_state.class_names = class_names
+                    st.sidebar.success("✅ Model loaded!")
+                    
+                    # Check class order mismatch
+                    if st.session_state.checkpoint_classes:
+                        st.sidebar.write("**Classes from checkpoint:**")
+                        for i, cls in enumerate(st.session_state.checkpoint_classes):
+                            st.sidebar.write(f"{i}: {cls}")
+                        
+                        if st.session_state.checkpoint_classes != class_names:
+                            st.sidebar.error("⚠️ CLASS ORDER MISMATCH DETECTED!")
+                            st.sidebar.write("Your classes.txt order doesn't match the checkpoint!")
+                
+            except Exception as e:
+                st.sidebar.error(f"Error: {e}")
+                import traceback
+                st.sidebar.code(traceback.format_exc())
+    else:
+        st.sidebar.error("Please upload both files!")
+
+st.sidebar.divider()
+if st.session_state.model:
+    st.sidebar.success("🟢 Model Ready")
+else:
+    st.sidebar.warning("🟡 No Model Loaded")
+
+# ----------------------------
+# Main Content
+# ----------------------------
+st.header("📤 Upload Test Image")
+
+uploaded_image = st.file_uploader("Choose an image", type=["jpg", "jpeg", "png"])
+
+if uploaded_image:
+    image = Image.open(uploaded_image).convert("RGB")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.image(image, caption="Uploaded Image", use_container_width=True)
+    
+    with col2:
+        if st.session_state.model:
+            if st.button("🚀 Predict with Debug Info", type="primary"):
+                st.subheader("🔍 Debug Information")
+                
+                # Select transform
+                if transform_version == "v1 (Original)":
+                    transform = get_transform_v1(img_size)
+                elif transform_version == "v2 (No Lambda)":
+                    transform = get_transform_v2(img_size)
+                else:
+                    transform = get_transform_v3(img_size)
+                
+                st.write(f"**Using transform: {transform_version}**")
+                
+                try:
+                    predicted_idx, confidence, probabilities = predict_with_debug(
+                        st.session_state.model,
+                        image,
+                        transform,
+                        st.session_state.device,
+                        st.session_state.class_names
+                    )
+                    
+                    st.divider()
+                    st.subheader("🎯 Final Prediction")
+                    
+                    # Always use checkpoint classes if available
+                    if st.session_state.checkpoint_classes:
+                        checkpoint_pred = st.session_state.checkpoint_classes[predicted_idx]
+                        st.success(f"**Predicted: {checkpoint_pred}**")
+                        st.metric("Confidence", f"{confidence*100:.2f}%")
+                    else:
+                        predicted_class = st.session_state.class_names[predicted_idx]
+                        st.success(f"**Predicted: {predicted_class}**")
+                        st.metric("Confidence", f"{confidence*100:.2f}%")
+                        st.warning("⚠️ No checkpoint classes found - using uploaded classes.txt")
+                    
+                except Exception as e:
+                    st.error(f"Error: {e}")
+                    import traceback
+                    st.code(traceback.format_exc())
+        else:
+            st.warning("Please load model first")
+
+
+
+st.divider()
+st.caption("Debug Mode - Identifies prediction issues")
