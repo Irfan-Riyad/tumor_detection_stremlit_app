@@ -11,13 +11,12 @@ import numpy as np
 # Page Config
 # ----------------------------
 st.set_page_config(
-    page_title="Brain Tumor Classifier - Debug Mode", 
+    page_title="Brain Tumor Classifier", 
     page_icon="🧠",
     layout="wide"
 )
 
-st.title("🧠 HybridCNN Brain Tumor Classifier - Debug Mode")
-st.markdown("**Debugging wrong predictions**")
+st.title("🧠 HybridCNN Brain Tumor Classifier")
 
 # ----------------------------
 # Session State
@@ -212,11 +211,18 @@ def predict_with_debug(model, image, transform, device, class_names):
     # Softmax
     probabilities = torch.softmax(logits, dim=1)[0]
     
-    st.write("**Probabilities:**")
+    st.write("**Top 5 Predictions:**")
     # Use checkpoint classes if available, otherwise use provided class_names
     display_classes = st.session_state.checkpoint_classes if st.session_state.checkpoint_classes else class_names
-    for i, (cls, prob) in enumerate(zip(display_classes, probabilities.cpu().numpy())):
-        st.write(f"- {cls}: {prob:.6f} ({prob*100:.2f}%)")
+    
+    # Get top 5 predictions sorted by probability (descending)
+    probs_np = probabilities.cpu().numpy()
+    top5_indices = np.argsort(probs_np)[-5:][::-1]  # Get top 5 indices in descending order
+    
+    for rank, idx in enumerate(top5_indices, 1):
+        cls = display_classes[idx]
+        prob = probs_np[idx]
+        st.write(f"{rank}. {cls}: {prob:.6f} ({prob*100:.2f}%)")
     
     confidence, predicted_idx = torch.max(probabilities, 0)
     
@@ -338,7 +344,9 @@ if uploaded_image:
         else:
             st.warning("Please load model first")
 
-
+# ----------------------------
+# Troubleshooting Guide
+# ----------------------------
 
 st.divider()
 st.caption("Debug Mode - Identifies prediction issues")
